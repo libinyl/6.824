@@ -2,13 +2,13 @@ package mr
 
 import (
 	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
 	"sync"
 	"sync/atomic"
 )
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
 
 const (
 	workerStatusLive = "live"
@@ -32,7 +32,7 @@ type Coordinator struct {
 type mapTask struct {
 	l sync.RWMutex
 
-	taskId int
+	id     int
 	file   string
 	status string
 }
@@ -40,7 +40,7 @@ type mapTask struct {
 type reduceTask struct {
 	l sync.RWMutex
 
-	taskId int
+	id     int
 	status string
 }
 
@@ -62,47 +62,61 @@ func (c *Coordinator) WorkerInitHandShake(req *WorkerInitHandShakeReq, rsp *Work
 
 	// master 更新该worker的状态
 	c.workerStatus.Store(rsp.AssignedId, workerStatusLive)
+	log.Printf("接收到 worker 注册请求.已为其分配 id:%v", rsp.AssignedId)
 	return nil
 }
 
 // RequestTask worker 向 master 请求分配任务
 // master 找到一个 idle 的 task,分配给该 worker
 func (c *Coordinator) RequestTask(req *RequestTaskReq, rsp *RequestTaskRsp) error {
+	log.Printf("接收到 worker [%v] 的分配请求.", req.WorkerId)
+
 	// master 更新该worker的状态
 	c.workerStatus.Store(req.WorkerId, workerStatusLive)
 
 	isAllMapDone := func() bool {
-		return int(c.completedMapTasksCnt) == len(c.mapTasks)
+		log.Printf("当前已完成 maptask 数量:%v", c.completedMapTasksCnt)
+		return c.completedMapTasksCnt == len(c.mapTasks)
 	}
 
 	if !isAllMapDone() {
 		// 找到一个 idle 的 task
 		for _, task := range c.mapTasks {
 			task.l.RLock()
+			defer task.l.RUnlock()
 			if task.status == TaskStatusIdle {
+				rsp.TaskType = "map"
+				rsp.MapTaskId = task.id
 				rsp.MapTaskFilename = task.file
 				task.status = TaskStatusInProgress
+				log.Printf("已为 worker [%v] 分配了 map 任务[%v]", req.WorkerId, task.id)
+				return nil
 			}
-			task.l.RUnlock()
 		}
+		log.Printf("未找到适合分配的 map task")
 		return nil
 	}
 
 	// 如果所有 map 都执行完了, 就从 reduceTask 里找可分配的任务
 	for _, task := range c.reduceTasks {
 		task.l.RLock()
+		defer task.l.RUnlock()
 		if task.status == TaskStatusIdle {
-			rsp.ReduceTaskId = task.taskId
+			rsp.TaskType = "reduce"
+			rsp.ReduceTaskId = task.id
 			task.status = TaskStatusInProgress
+			log.Printf("已为 worker [%v] 分配了reduce 任务[%v]", req.WorkerId, task.id)
+			return nil
 		}
-		task.l.RUnlock()
 	}
-
+	log.Printf("未找到适合分配的 reduce task")
 	return nil
 }
 
 // ReportStatus 上报 worker 状态和任务信息
 func (c *Coordinator) ReportStatus(req *ReportStatusReq, rsp *ReportStatusRsp) error {
+	log.Printf("接收到 worker[%v]的汇报,[%v]任务[%v]状态为[%v]", req.WorkerId, req.TaskType, req.TaskId, req.TaskStatus)
+
 	// 首先标注该 worker 是正常的
 	c.workerStatus.Store(req.WorkerId, workerStatusLive)
 
@@ -110,7 +124,7 @@ func (c *Coordinator) ReportStatus(req *ReportStatusReq, rsp *ReportStatusRsp) e
 	if req.TaskType == "map" {
 		for _, task := range c.mapTasks {
 			task.l.RLock()
-			if task.taskId == req.TaskId {
+			if task.id == req.TaskId {
 				task.status = req.TaskStatus
 				if task.status == TaskStatusCompleted {
 					c.completedMapTasksCnt++
@@ -123,7 +137,7 @@ func (c *Coordinator) ReportStatus(req *ReportStatusReq, rsp *ReportStatusRsp) e
 	if req.TaskType == "reduce" {
 		for _, task := range c.reduceTasks {
 			task.l.RLock()
-			if task.taskId == req.TaskId {
+			if task.id == req.TaskId {
 				task.status = req.TaskStatus
 				if task.status == TaskStatusCompleted {
 					c.completedReduceTasksCnt++
@@ -157,12 +171,15 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 //
 func (c *Coordinator) Done() bool {
-	ret := false
+	//ret := false
 
 	// Your code here.
-	ret = c.completedReduceTasksCnt == len(c.reduceTasks)
-
-	return ret
+	//ret = c.completedReduceTasksCnt == len(c.reduceTasks)
+	done := c.completedReduceTasksCnt == len(c.reduceTasks)
+	if done {
+		log.Printf("所有任务执行完毕,程序即将退出")
+	}
+	return done
 }
 
 //
@@ -171,6 +188,8 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
 	c := Coordinator{}
 
 	// Your code here.
@@ -180,7 +199,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	// 初始化maptask
 	for i, file := range files {
 		c.mapTasks = append(c.mapTasks, &mapTask{
-			taskId: i,
+			id:     i,
 			file:   file,
 			status: TaskStatusIdle,
 		})
@@ -188,10 +207,12 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	// 初始化 reducetask
 	for i := 0; i < c.nReduce; i++ {
 		c.reduceTasks = append(c.reduceTasks, &reduceTask{
-			taskId: i,
+			id:     i,
 			status: TaskStatusIdle,
 		})
 	}
+
+	log.Printf("server started. state: %+v", c)
 
 	c.server()
 	return &c

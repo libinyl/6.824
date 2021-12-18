@@ -3,13 +3,16 @@ package mr
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io/ioutil"
+	"log"
+	"net/rpc"
 	"os"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 )
-import "log"
-import "net/rpc"
-import "hash/fnv"
 
 //
 // Map functions return a slice of KeyValue.
@@ -29,17 +32,43 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
+func taskFilename(mapTaskId, reduceTaskId int) string {
+	return fmt.Sprintf("mr-%d-%d", mapTaskId, reduceTaskId)
+}
+
 func saveMapOutput(mapTaskId int, mapOutput []KeyValue) error {
-	for _, kv := range mapOutput {
-		reduceTaskId := ihash(kv.Key) % nReduce
-		filename := fmt.Sprintf("mr-%d-%d", mapTaskId, reduceTaskId)
-		file, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0)
+	log.Printf("saveMapOutput: taskid:[%v],kv lenth: [%v]", mapTaskId, len(mapOutput))
+	sort.Sort(ByKey(mapOutput))
+
+	indexKv := func() map[string][]KeyValue {
+		file2KVs := make(map[string][]KeyValue)
+		for _, kv := range mapOutput {
+			reduceTaskId := ihash(kv.Key) % nReduce
+			filename := taskFilename(mapTaskId, reduceTaskId)
+			file2KVs[filename] = append(file2KVs[filename], kv)
+		}
+		return file2KVs
+	}
+
+	file2KVs := indexKv()
+
+	for file, kvs := range file2KVs {
+		file, err := os.OpenFile(file, os.O_CREATE|os.O_RDWR|os.O_APPEND, os.ModePerm)
 		if err != nil {
 			return err
 		}
+		defer file.Close()
 
 		encoder := json.NewEncoder(file)
-		for _, kv := range mapOutput {
+		for _, kv := range kvs {
 			err := encoder.Encode(&kv)
 			if err != nil {
 				return err
@@ -70,6 +99,8 @@ func Worker(mapf func(string, string) []KeyValue,
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
 
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
 	// 1. 请求 master 分配 workerid
 	myId, nReduce = initHandShake()
 
@@ -90,25 +121,113 @@ func Worker(mapf func(string, string) []KeyValue,
 
 		for range ticker.C {
 			taskType, mapTaskId, mapFilename, reduceTaskId := requestTask(myId)
-			if taskType == "map" {
+			switch taskType {
+			case "":
+				log.Printf("worker:[%v],暂无可执行的任务", myId)
+			case "map":
+				currTaskType = "map"
+				log.Printf("已得到分配的 map 任务.TaskId:[%v], mapFilename:[%v]", taskType, mapTaskId)
+				currTaskStatus = TaskStatusInProgress
+				currTaskId = mapTaskId
 				handleMap(mapTaskId, mapFilename, mapf)
-			} else {
+				currTaskStatus = TaskStatusCompleted
+			case "reduce":
+				currTaskType = "reduce"
+				currTaskStatus = TaskStatusInProgress
+				currTaskId = reduceTaskId
 				handleReduce(reduceTaskId, reducef)
+				currTaskStatus = TaskStatusCompleted
+			default:
+				log.Fatal("未能识别的taskType:%v", taskType)
 			}
 		}
 	}()
 	select {}
 }
 
-// 接收到任务, 干活
-
+// handleMap 处理 map 任务
 func handleMap(taskId int, filename string, mapf func(string, string) []KeyValue) {
-	content := readFile(filename)
-	saveMapOutput(taskId, mapf(filename, content))
+	content := string(readFile(filename))
+	err := saveMapOutput(taskId, mapf(filename, content))
+	if err != nil {
+		log.Fatalf("saveMapOutput err:%v", err)
+	}
 }
 
+// handleReduce 处理 reduce 任务
 func handleReduce(taskId int, reducef func(string, []string) string) {
+	collectTargetFiles := func(reduceTaskId int) []string {
+		targetfiles := []string{}
+		fileInfos, err := ioutil.ReadDir(".")
+		if err != nil {
+			log.Fatal(err)
+		}
+		for _, fi := range fileInfos {
+			filename := fi.Name()
+			parts := strings.Split(filename, "-")
+			if len(parts) == 3 {
+				Y, err := strconv.Atoi(parts[2])
+				if err != nil {
+					continue
+				}
+				if Y == taskId {
+					targetfiles = append(targetfiles, filename)
+				}
+			}
+		}
+		return targetfiles
+	}
+	targetFiles := collectTargetFiles(taskId)
 
+	var allKvs []KeyValue
+	for _, f := range targetFiles {
+		fileStream, err2 := os.Open(f)
+		if err2 != nil {
+			log.Fatal(err2)
+		}
+		dec := json.NewDecoder(fileStream)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			allKvs = append(allKvs, kv)
+		}
+	}
+
+	sort.Sort(ByKey(allKvs))
+
+	saveReduce(fmt.Sprintf("mr-out-%d", taskId), allKvs, reducef)
+}
+
+func saveReduce(oname string, intermediate []KeyValue, reducef func(string, []string) string) {
+	log.Printf("saveReduce to [%v],intermediate size:%v", oname, len(intermediate))
+
+	ofile, _ := os.Create(oname)
+
+	//
+	// call Reduce on each distinct key in intermediate[],
+	// and print the result to mr-out-0.
+	//
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+
+	ofile.Close()
 }
 
 func reportStatus(workerId, taskId int, taskType, taskStatus string) (int, int, string, string) {
@@ -183,7 +302,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	return false
 }
 
-func readFile(filename string) string {
+func readFile(filename string) []byte {
 
 	file, err := os.Open(filename)
 	if err != nil {
@@ -194,5 +313,5 @@ func readFile(filename string) string {
 		log.Fatalf("cannot read %v", filename)
 	}
 	file.Close()
-	return string(content)
+	return content
 }
