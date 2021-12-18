@@ -29,21 +29,24 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-func saveMapOutput(mapTaskId, nReduce int, mapKey string, mapOutput []KeyValue) error {
-	reduceTaskId := ihash(mapKey) % nReduce
-	filename := fmt.Sprintf("mr-%d-%d", mapTaskId, reduceTaskId)
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0)
-	if err != nil {
-		return err
-	}
-
-	encoder := json.NewEncoder(file)
+func saveMapOutput(mapTaskId int, mapOutput []KeyValue) error {
 	for _, kv := range mapOutput {
-		err := encoder.Encode(&kv)
+		reduceTaskId := ihash(kv.Key) % nReduce
+		filename := fmt.Sprintf("mr-%d-%d", mapTaskId, reduceTaskId)
+		file, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0)
 		if err != nil {
 			return err
 		}
+
+		encoder := json.NewEncoder(file)
+		for _, kv := range mapOutput {
+			err := encoder.Encode(&kv)
+			if err != nil {
+				return err
+			}
+		}
 	}
+
 	return nil
 }
 
@@ -88,9 +91,9 @@ func Worker(mapf func(string, string) []KeyValue,
 		for range ticker.C {
 			taskType, mapTaskId, mapFilename, reduceTaskId := requestTask(myId)
 			if taskType == "map" {
-				handleMap(mapTaskId, mapFilename)
+				handleMap(mapTaskId, mapFilename, mapf)
 			} else {
-				handleReduce(reduceTaskId)
+				handleReduce(reduceTaskId, reducef)
 			}
 		}
 	}()
@@ -99,11 +102,12 @@ func Worker(mapf func(string, string) []KeyValue,
 
 // 接收到任务, 干活
 
-func handleMap(taskId int, filename string) {
-
+func handleMap(taskId int, filename string, mapf func(string, string) []KeyValue) {
+	content := readFile(filename)
+	saveMapOutput(taskId, mapf(filename, content))
 }
 
-func handleReduce(taskId int) {
+func handleReduce(taskId int, reducef func(string, []string) string) {
 
 }
 
