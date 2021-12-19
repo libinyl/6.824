@@ -203,7 +203,10 @@ func handleReduce(taskId int, reducef func(string, []string) string) {
 func saveReduce(oname string, intermediate []KeyValue, reducef func(string, []string) string) {
 	log.Printf("saveReduce to [%v],intermediate size:%v", oname, len(intermediate))
 
-	ofile, _ := os.Create(oname)
+	ofile, err := os.Create(oname)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	//
 	// call Reduce on each distinct key in intermediate[],

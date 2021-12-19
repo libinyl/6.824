@@ -18,7 +18,6 @@ const (
 type Coordinator struct {
 	// Your definitions here.
 
-	nReduce      int
 	workerStatus sync.Map
 	mapTasks     []*mapTask
 	reduceTasks  []*reduceTask
@@ -30,17 +29,17 @@ type Coordinator struct {
 }
 
 type mapTask struct {
-	l sync.RWMutex
+	id   int
+	file string
 
-	id     int
-	file   string
+	mu     sync.Mutex
 	status string
 }
 
 type reduceTask struct {
-	l sync.RWMutex
+	id int
 
-	id     int
+	mu     sync.Mutex
 	status string
 }
 
@@ -57,7 +56,7 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 // WorkerInitHandShake worker 启动时与服务握手
 func (c *Coordinator) WorkerInitHandShake(req *WorkerInitHandShakeReq, rsp *WorkerInitHandShakeRsp) error {
 	// worker 拿到 reduce任务数,得知自己的 id
-	rsp.ReduceCnt = c.nReduce
+	rsp.ReduceCnt = len(c.reduceTasks)
 	rsp.AssignedId = c.newWorkerId()
 
 	// master 更新该worker的状态
@@ -75,21 +74,28 @@ func (c *Coordinator) RequestTask(req *RequestTaskReq, rsp *RequestTaskRsp) erro
 	c.workerStatus.Store(req.WorkerId, workerStatusLive)
 
 	isAllMapDone := func() bool {
-		log.Printf("当前已完成 maptask 数量:%v", c.completedMapTasksCnt)
+		log.Printf("当前已完成 maptask 数量:%v/%v", c.completedMapTasksCnt, len(c.mapTasks))
+		log.Printf("当前已完成 reduce 数量:%v/%v", c.completedReduceTasksCnt, len(c.reduceTasks))
+
 		return c.completedMapTasksCnt == len(c.mapTasks)
 	}
+
+	assigned := false
 
 	if !isAllMapDone() {
 		// 找到一个 idle 的 task
 		for _, task := range c.mapTasks {
-			task.l.RLock()
-			defer task.l.RUnlock()
+			task.mu.Lock()
 			if task.status == TaskStatusIdle {
 				rsp.TaskType = "map"
 				rsp.MapTaskId = task.id
 				rsp.MapTaskFilename = task.file
 				task.status = TaskStatusInProgress
+				assigned = true
 				log.Printf("已为 worker [%v] 分配了 map 任务[%v]", req.WorkerId, task.id)
+			}
+			task.mu.Unlock()
+			if assigned {
 				return nil
 			}
 		}
@@ -98,14 +104,18 @@ func (c *Coordinator) RequestTask(req *RequestTaskReq, rsp *RequestTaskRsp) erro
 	}
 
 	// 如果所有 map 都执行完了, 就从 reduceTask 里找可分配的任务
+
 	for _, task := range c.reduceTasks {
-		task.l.RLock()
-		defer task.l.RUnlock()
+		task.mu.Lock()
 		if task.status == TaskStatusIdle {
 			rsp.TaskType = "reduce"
 			rsp.ReduceTaskId = task.id
 			task.status = TaskStatusInProgress
-			log.Printf("已为 worker [%v] 分配了reduce 任务[%v]", req.WorkerId, task.id)
+			assigned = true
+			log.Printf("已为 worker [%v] 分配了 reduce 任务[%v]", req.WorkerId, task.id)
+		}
+		task.mu.Unlock()
+		if assigned {
 			return nil
 		}
 	}
@@ -121,30 +131,42 @@ func (c *Coordinator) ReportStatus(req *ReportStatusReq, rsp *ReportStatusRsp) e
 	c.workerStatus.Store(req.WorkerId, workerStatusLive)
 
 	// 更新任务状态
+	updated := false
 	if req.TaskType == "map" {
 		for _, task := range c.mapTasks {
-			task.l.RLock()
+			task.mu.Lock()
 			if task.id == req.TaskId {
 				task.status = req.TaskStatus
 				if task.status == TaskStatusCompleted {
 					c.completedMapTasksCnt++
 				}
+				updated = true
 			}
-			task.l.RUnlock()
+			task.mu.Unlock()
+			if updated {
+				return nil
+			}
 		}
+
+		return nil
 	}
 
 	if req.TaskType == "reduce" {
 		for _, task := range c.reduceTasks {
-			task.l.RLock()
+			task.mu.Lock()
 			if task.id == req.TaskId {
 				task.status = req.TaskStatus
 				if task.status == TaskStatusCompleted {
 					c.completedReduceTasksCnt++
 				}
+				updated = true
 			}
-			task.l.RLock()
+			task.mu.Unlock()
+			if updated {
+				return nil
+			}
 		}
+
 	}
 
 	return nil
@@ -156,7 +178,7 @@ func (c *Coordinator) ReportStatus(req *ReportStatusReq, rsp *ReportStatusRsp) e
 func (c *Coordinator) server() {
 	rpc.Register(c)
 	rpc.HandleHTTP()
-	//l, e := net.Listen("tcp", ":1234")
+	//mu, e := net.Listen("tcp", ":1234")
 	sockname := coordinatorSock()
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
@@ -193,7 +215,6 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
 	// Your code here.
-	c.nReduce = nReduce
 	c.newWorkerId = newIdGenerator()
 
 	// 初始化maptask
@@ -205,7 +226,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		})
 	}
 	// 初始化 reducetask
-	for i := 0; i < c.nReduce; i++ {
+	for i := 0; i < nReduce; i++ {
 		c.reduceTasks = append(c.reduceTasks, &reduceTask{
 			id:     i,
 			status: TaskStatusIdle,
