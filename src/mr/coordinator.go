@@ -22,8 +22,8 @@ type Coordinator struct {
 	mapTasks     []*mapTask
 	reduceTasks  []*reduceTask
 
-	completedMapTasksCnt    int
-	completedReduceTasksCnt int
+	completedMapTasks    map[int]struct{}
+	completedReduceTasks map[int]struct{}
 
 	newWorkerId func() int
 }
@@ -74,52 +74,42 @@ func (c *Coordinator) RequestTask(req *RequestTaskReq, rsp *RequestTaskRsp) erro
 	c.workerStatus.Store(req.WorkerId, workerStatusLive)
 
 	isAllMapDone := func() bool {
-		log.Printf("当前已完成 maptask 数量:%v/%v", c.completedMapTasksCnt, len(c.mapTasks))
-		log.Printf("当前已完成 reduce 数量:%v/%v", c.completedReduceTasksCnt, len(c.reduceTasks))
+		log.Printf("当前已完成 maptask 数量:%v/%v", len(c.completedMapTasks), len(c.mapTasks))
+		log.Printf("当前已完成 reduce 数量:%v/%v", len(c.completedReduceTasks), len(c.reduceTasks))
 
-		return c.completedMapTasksCnt == len(c.mapTasks)
+		return len(c.completedMapTasks) == len(c.mapTasks)
 	}
-
-	assigned := false
 
 	if !isAllMapDone() {
 		// 找到一个 idle 的 task
-		for _, task := range c.mapTasks {
-			task.mu.Lock()
-			if task.status == TaskStatusIdle {
-				rsp.TaskType = "map"
-				rsp.MapTaskId = task.id
-				rsp.MapTaskFilename = task.file
-				task.status = TaskStatusInProgress
-				assigned = true
-				log.Printf("已为 worker [%v] 分配了 map 任务[%v]", req.WorkerId, task.id)
-			}
-			task.mu.Unlock()
-			if assigned {
-				return nil
-			}
+		findTask := func(m *mapTask) bool { return m.status == TaskStatusIdle }
+		processTask := func(m *mapTask) {
+			rsp.TaskType = "map"
+			rsp.MapTaskId = m.id
+			rsp.MapTaskFilename = m.file
+			m.status = TaskStatusInProgress
 		}
-		log.Printf("未找到适合分配的 map task")
+		found := c.accessOneMapTask(findTask, processTask)
+
+		if !found {
+			log.Printf("未找到适合分配的 map task")
+		}
 		return nil
 	}
 
 	// 如果所有 map 都执行完了, 就从 reduceTask 里找可分配的任务
-
-	for _, task := range c.reduceTasks {
-		task.mu.Lock()
-		if task.status == TaskStatusIdle {
-			rsp.TaskType = "reduce"
-			rsp.ReduceTaskId = task.id
-			task.status = TaskStatusInProgress
-			assigned = true
-			log.Printf("已为 worker [%v] 分配了 reduce 任务[%v]", req.WorkerId, task.id)
-		}
-		task.mu.Unlock()
-		if assigned {
-			return nil
-		}
+	findTask := func(r *reduceTask) bool { return r.status == TaskStatusIdle }
+	processTask := func(r *reduceTask) {
+		rsp.TaskType = "reduce"
+		rsp.ReduceTaskId = r.id
+		r.status = TaskStatusInProgress
 	}
-	log.Printf("未找到适合分配的 reduce task")
+
+	found := c.accessOneReduceTask(findTask, processTask)
+	if !found {
+		log.Printf("未找到适合分配的 reduce task")
+	}
+
 	return nil
 }
 
@@ -130,45 +120,40 @@ func (c *Coordinator) ReportStatus(req *ReportStatusReq, rsp *ReportStatusRsp) e
 	// 首先标注该 worker 是正常的
 	c.workerStatus.Store(req.WorkerId, workerStatusLive)
 
-	// 更新任务状态
-	updated := false
-	if req.TaskType == "map" {
-		for _, task := range c.mapTasks {
-			task.mu.Lock()
-			if task.id == req.TaskId {
-				task.status = req.TaskStatus
-				if task.status == TaskStatusCompleted {
-					c.completedMapTasksCnt++
-				}
-				updated = true
-			}
-			task.mu.Unlock()
-			if updated {
-				return nil
-			}
-		}
-
+	if req.TaskType != "map" && req.TaskType != "reduce" && req.TaskType != "" {
+		log.Fatalf("ReportStatus: bad TaskType:%v", req.TaskType)
+	}
+	if req.TaskStatus != TaskStatusIdle && req.TaskStatus != TaskStatusCompleted && req.TaskStatus != TaskStatusInProgress {
 		return nil
 	}
 
-	if req.TaskType == "reduce" {
-		for _, task := range c.reduceTasks {
-			task.mu.Lock()
-			if task.id == req.TaskId {
-				task.status = req.TaskStatus
-				if task.status == TaskStatusCompleted {
-					c.completedReduceTasksCnt++
-				}
-				updated = true
-			}
-			task.mu.Unlock()
-			if updated {
-				return nil
+	// 更新任务状态
+	if req.TaskType == "map" {
+		findTask := func(m *mapTask) bool { return m.id == req.TaskId }
+		processTask := func(m *mapTask) {
+			m.status = req.TaskStatus
+			if m.status == TaskStatusCompleted {
+				c.completedMapTasks[m.id] = struct{}{}
 			}
 		}
 
+		c.accessOneMapTask(findTask, processTask)
+		return nil
 	}
+	if req.TaskType == "reduce" {
 
+		findTask := func(m *reduceTask) bool { return m.id == req.TaskId }
+
+		processTask := func(m *reduceTask) {
+			m.status = req.TaskStatus
+			if m.status == TaskStatusCompleted {
+				c.completedReduceTasks[m.id] = struct{}{}
+			}
+		}
+		c.accessOneReduceTask(findTask, processTask)
+
+		return nil
+	}
 	return nil
 }
 
@@ -196,8 +181,8 @@ func (c *Coordinator) Done() bool {
 	//ret := false
 
 	// Your code here.
-	//ret = c.completedReduceTasksCnt == len(c.reduceTasks)
-	done := c.completedReduceTasksCnt == len(c.reduceTasks)
+	//ret = c.completedReduceTasks == len(c.reduceTasks)
+	done := len(c.completedReduceTasks) == len(c.reduceTasks)
 	if done {
 		log.Printf("所有任务执行完毕,程序即将退出")
 	}
@@ -216,6 +201,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	// Your code here.
 	c.newWorkerId = newIdGenerator()
+	c.completedMapTasks = make(map[int]struct{})
+	c.completedReduceTasks = make(map[int]struct{})
 
 	// 初始化maptask
 	for i, file := range files {
@@ -233,7 +220,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		})
 	}
 
-	log.Printf("server started. state: %+v", c)
+	log.Printf("server started. state: %+v", &c)
 
 	c.server()
 	return &c
@@ -245,4 +232,40 @@ var newIdGenerator = func() func() int {
 		atomic.AddInt32(&id, 1)
 		return int(id)
 	}
+}
+
+// accessOneMapTask 原子访问 maptask. 返回是否找到并处理了目标的 task
+func (c *Coordinator) accessOneMapTask(findTask func(m *mapTask) bool, processTask func(m *mapTask)) bool {
+	// 找到一个 idle 的 task
+	foundTask := false
+	for _, task := range c.mapTasks {
+		task.mu.Lock()
+		if findTask(task) {
+			processTask(task)
+			foundTask = true
+		}
+		task.mu.Unlock()
+		if foundTask {
+			return true
+		}
+	}
+	return false
+}
+
+// accessOneMapTask 原子访问 reducetask
+func (c *Coordinator) accessOneReduceTask(findTask func(m *reduceTask) bool, processTask func(m *reduceTask)) bool {
+	// 找到一个 idle 的 task
+	foundTask := false
+	for _, task := range c.reduceTasks {
+		task.mu.Lock()
+		if findTask(task) {
+			processTask(task)
+			foundTask = true
+		}
+		task.mu.Unlock()
+		if foundTask {
+			return true
+		}
+	}
+	return false
 }

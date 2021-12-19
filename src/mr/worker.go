@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -80,6 +81,8 @@ func saveMapOutput(mapTaskId int, mapOutput []KeyValue) error {
 }
 
 var (
+	mu sync.Mutex
+
 	myId    int
 	nReduce int
 
@@ -110,7 +113,9 @@ func Worker(mapf func(string, string) []KeyValue,
 		defer ticker.Stop()
 
 		for range ticker.C {
+			mu.Lock()
 			reportStatus(myId, currTaskId, currTaskType, currTaskStatus)
+			mu.Unlock()
 		}
 	}()
 
@@ -125,18 +130,24 @@ func Worker(mapf func(string, string) []KeyValue,
 			case "":
 				log.Printf("worker:[%v],暂无可执行的任务", myId)
 			case "map":
+				log.Printf("已得到分配的 map 任务.TaskId:[%v], filename:[%v]", mapTaskId, mapFilename)
+				mu.Lock()
 				currTaskType = "map"
-				log.Printf("已得到分配的 map 任务.TaskId:[%v], mapFilename:[%v]", taskType, mapTaskId)
 				currTaskStatus = TaskStatusInProgress
 				currTaskId = mapTaskId
 				handleMap(mapTaskId, mapFilename, mapf)
 				currTaskStatus = TaskStatusCompleted
+				mu.Unlock()
 			case "reduce":
+				mu.Lock()
+				log.Printf("已得到分配的 reduce 任务.TaskId:[%v]", reduceTaskId)
+
 				currTaskType = "reduce"
 				currTaskStatus = TaskStatusInProgress
 				currTaskId = reduceTaskId
 				handleReduce(reduceTaskId, reducef)
 				currTaskStatus = TaskStatusCompleted
+				mu.Unlock()
 			default:
 				log.Fatal("未能识别的taskType:%v", taskType)
 			}
